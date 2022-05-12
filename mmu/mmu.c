@@ -223,23 +223,31 @@ void zero_memory(void *ptr, unsigned long nbytes)
  * 8kB PGD level pointing to 4kB PTE pages.
  */
 unsigned long *pgdir = (unsigned long *) 0x10000;
-unsigned long *proc_tbl = (unsigned long *) 0x12000;
-unsigned long *part_tbl = (unsigned long *) 0x13000;
-unsigned long *part_pgdir = (unsigned long *) 0x14000;
-unsigned long free_ptr = 0x15000;
+unsigned long *proc_tbl = (unsigned long *) 0x20000;
+unsigned long *part_tbl = (unsigned long *) 0x1020000;
+unsigned long *part_pgdir = (unsigned long *) 0x1030000;
+unsigned long free_ptr = 0x1040000;
 void *eas_mapped[4];
 int neas_mapped;
 
 extern void register_process_table(unsigned long proc_tbl, unsigned long ptbs);
+#define P9_PIDR_BITS 20
+
+/*
+ * P9 MMU config:
+ * Process table (8M)
+ * 20 PIDR bits ==> 1048576 process table entries
+ * Radix tree levels for 64k pages:
+ *      sizes: 64 KB | 4 KB | 4 KB | 256 B
+ *   #entries:  8192 |  512 |  512 |    32
+ */
 void init_process_table(void)
 {
-	zero_memory(proc_tbl, 512 * sizeof(unsigned long));
+	zero_memory(proc_tbl, (1UL << P9_PIDR_BITS) * sizeof(unsigned long) * 2);
+	zero_memory(pgdir, 8192 * sizeof(unsigned long));
 
-	mtspr(PID, 1);
-	zero_memory(pgdir, 1024 * sizeof(unsigned long));
-
-	/* RTS = 0 (2GB address space), RPDS = 10 (1024-entry top level) */
-	store_pte(&proc_tbl[2 * 1], (unsigned long) pgdir | 10);
+	/* RTS = 21, RPDS = 13 (8192-entry top level) */
+	store_pte(&proc_tbl[0], ((0x5UL << 5) | (0x2UL << 61)) | (unsigned long) pgdir | 0xd);
 }
 
 void init_partition_table(void)
@@ -287,15 +295,15 @@ void init_mmu(void)
 	}
 }
 
-static unsigned long *read_pgd(unsigned long i)
+static unsigned long *read_pgd(unsigned long i, unsigned long *pgd)
 {
 	unsigned long ret;
 
 #ifdef __LITTLE_ENDIAN__
-	__asm__ volatile("ldbrx %0,%1,%2" : "=r" (ret) : "b" (pgdir),
+	__asm__ volatile("ldbrx %0,%1,%2" : "=r" (ret) : "b" (pgd),
 			 "r" (i * sizeof(unsigned long)));
 #else
-	__asm__ volatile("ldx   %0,%1,%2" : "=r" (ret) : "b" (pgdir),
+	__asm__ volatile("ldx   %0,%1,%2" : "=r" (ret) : "b" (pgd),
 			 "r" (i * sizeof(unsigned long)));
 #endif
 	return (unsigned long *) (ret & 0x00ffffffffffff00);
@@ -303,19 +311,42 @@ static unsigned long *read_pgd(unsigned long i)
 
 void map(void *ea, void *pa, unsigned long perm_attr)
 {
-	unsigned long epn = (unsigned long) ea >> 12;
-	unsigned long i, j;
+	unsigned long eaddr = (unsigned long) ea;
+	unsigned long pfn = (unsigned long) pa & ~0xffff;
+	unsigned long i;
 	unsigned long *ptep;
+	unsigned long offset = 52;
 
-	i = (epn >> 9) & 0x3ff;
-	j = epn & 0x1ff;
+	offset -= 13;
+	i = (eaddr >> offset) & 0x1fff;
 	if (pgdir[i] == 0) {
 		zero_memory((void *)free_ptr, 512 * sizeof(unsigned long));
 		store_pte(&pgdir[i], 0x8000000000000000 | free_ptr | 9);
 		free_ptr += 512 * sizeof(unsigned long);
 	}
-	ptep = read_pgd(i);
-	store_pte(&ptep[j], 0xc000000000000000 | ((unsigned long)pa & 0x00fffffffffff000) | perm_attr);
+	ptep = read_pgd(i, pgdir);
+
+	offset -= 9;
+	i = (eaddr >> offset) & 0x1ff;
+	if (ptep[i] == 0){
+		zero_memory((void *)free_ptr, 512 * sizeof(unsigned long));
+		store_pte(&ptep[i], 0x8000000000000000 | free_ptr | 9);
+		free_ptr += 512 * sizeof(unsigned long);
+	}
+	ptep = read_pgd(i, ptep);
+
+	offset -= 9;
+	i = (eaddr >> offset) & 0x1ff;
+	if (ptep[i] == 0){
+		zero_memory((void *)free_ptr, 32 * sizeof(unsigned long));
+		store_pte(&ptep[i], 0x8000000000000000 | free_ptr | 5);
+		free_ptr += 32 * sizeof(unsigned long);
+	}
+	ptep = read_pgd(i, ptep);
+
+	offset -= 5;
+	i = (eaddr >> offset) & 0x1f;
+	store_pte(&ptep[i], 0xc000000000000000 | ((unsigned long)pfn & 0x00fffffffffff000) | perm_attr);
 	eas_mapped[neas_mapped++] = ea;
 }
 
@@ -329,7 +360,7 @@ static void unmap_noinval(void *ea)
 	j = epn & 0x1ff;
 	if (pgdir[i] == 0)
 		return;
-	ptep = read_pgd(i);
+	ptep = read_pgd(i, pgdir);
 	store_pte(&ptep[j], 0);
 }
 
@@ -770,7 +801,7 @@ int mmu_test_18(void)
      * NOTE: keep everything that will be used with DR=1 on registers,
      *       to avoid DSIs caused by unmaped memory.
      */
-    long *mem = (long *) 0xa00000;
+    long *mem = (long *) 0x2010000;
     register long *ptr = (long *) 0x1230000;
     long val = 0x0123456789ABCDEF;
     long ret;
