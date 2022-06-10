@@ -20,6 +20,20 @@
 #define POWER9_MMU	1
 
 /*
+ * It's tricky to run invalid config tests in KVM.
+ * Sometimes we need to restart the VM to bring it back to a valid state.
+ * So KVM tests are divided in 3 parts:
+ * 1 - Partition/Process table alignment tests
+ * 2 - Radix Levels size/number tests
+ * 3 - Remaining tests
+ * KVM define is used to select the desired test set.
+ *
+ * A value of 0 means we're not running under KVM and then all tests
+ * are run.
+ */
+#define KVM		3
+
+/*
  * Flag that indicate if QEMU has the needed tlbie fix (i.e., it is able to
  * flush the TLB in the same Translation Block).
  * If not, a workaround is used in the needed tests.
@@ -47,6 +61,12 @@ static uint64_t msr_dflt;
 #define EXC_ISI		0x400
 #define EXC_HDSI	0xe00
 #define EXC_HISI	0xe20
+
+/* H_REGISTER_PROC_TBL flags */
+#define PROCTAB_NEW		0x18
+#define PROCTAB_DEREG		0x10
+#define PROCTAB_RADIX		0x04
+#define PROCTAB_GTSE		0x01
 
 /* SPRs */
 #define DSISR		18
@@ -262,7 +282,8 @@ extern int test_read(long *addr, long *ret, long init);
 extern int test_write(long *addr, long val);
 extern int test_dcbz(long *addr);
 extern int test_exec(int testno, unsigned long pc, unsigned long msr);
-extern void register_process_table(unsigned long proc_tbl, unsigned long ptbs);
+extern long register_process_table(unsigned long flags,
+	unsigned long proc_tbl, unsigned long ptbs);
 
 /* Functions */
 
@@ -371,12 +392,18 @@ static inline void mtmsrd(unsigned long msr)
 
 /* TLB functions */
 
+static inline void tlbie_sync()
+{
+	__asm__ volatile("eieio; tlbsync; ptesync" : : : "memory");
+}
+
 static inline void tlbie_all(int prs)
 {
 	if (prs)
 		TLBIE_5(IS_ALL, 0, RIC_ALL, 1, 1);
 	else
 		TLBIE_5(IS_ALL, 0, RIC_ALL, 0, 1);
+	tlbie_sync();
 }
 
 static inline void tlbie_va_nosync(unsigned long va, int prs)
@@ -387,11 +414,6 @@ static inline void tlbie_va_nosync(unsigned long va, int prs)
 		TLBIE_5(IS_VA | va | AP, PID << 32, RIC_TLB, 1, 1);
 	else
 		TLBIE_5(IS_VA | va | AP, PID << 32, RIC_TLB, 0, 1);
-}
-
-static inline void tlbie_sync()
-{
-	__asm__ volatile("eieio; tlbsync; ptesync" : : : "memory");
 }
 
 static inline void tlbie_va(unsigned long va, int prs)
@@ -506,7 +528,9 @@ void init_mmu(void)
 		mtspr(PIDR, PID);
 		tlbie_all(0);
 	} else {
-		register_process_table((unsigned long)proc_tbl, PROCTAB_SIZE_SHIFT);
+		register_process_table(
+			PROCTAB_NEW | PROCTAB_RADIX | PROCTAB_GTSE,
+			(unsigned long)proc_tbl, PROCTAB_SIZE_SHIFT);
 		mtspr(PIDR, PID);
 		tlbie_all(PRS);
 	}
@@ -677,7 +701,7 @@ static void mmu_clear(void)
 
 #if POWER9_MMU
 
-static int test_proctab_align(void)
+int test_proctab_align(void)
 {
 	bool hv;
 	unsigned long misaligned_proc_tbl, *ptbl;
@@ -686,11 +710,13 @@ static int test_proctab_align(void)
 	long *ptr2 = (long *) VA(0x881000);
 	long val;
 
+	mmu_clear();
+
 	/* setup a misaligned process table */
 	hv = mfmsr() & MSR_HV;
 	init_process_table();
 
-	misaligned_proc_tbl = (unsigned long)proc_tbl + 0x10000;
+	misaligned_proc_tbl = 0x100000;
 	ptbl = (unsigned long *)misaligned_proc_tbl;
 	ptbl[2] = proc_tbl[2];
 	ptbl[3] = proc_tbl[3];
@@ -701,14 +727,17 @@ static int test_proctab_align(void)
 		mtspr(PIDR, PID);
 		tlbie_all(0);
 	} else {
-		register_process_table(misaligned_proc_tbl, PROCTAB_SIZE_SHIFT);
+		register_process_table(
+			PROCTAB_NEW | PROCTAB_RADIX | PROCTAB_GTSE,
+			misaligned_proc_tbl, PROCTAB_SIZE_SHIFT);
 		mtspr(PIDR, PID);
 		tlbie_all(PRS);
 	}
 
-	/* map an address and try to read it */
-	map(ptr, mem, DFLT_PERM);
 	*mem = 0xbadf00d;
+
+	/* try to read an unmapped address */
+
 	/* this should fail */
 	if (test_read(ptr, &val, 0xbadc0de)) {
 		return 1;
@@ -721,44 +750,66 @@ static int test_proctab_align(void)
 	if (mfspr(DSISR) != DSISR_BAD_CONFIG) {
 		return 3;
 	}
+
+	/* map an address and try to read it */
+	map(ptr, mem, DFLT_PERM);
+	/* this should fail */
+	if (test_read(ptr, &val, 0xbadc0de)) {
+		return 4;
+	}
+	/* dest of load should be unchanged */
+	if (val != 0xbadc0de) {
+		return 5;
+	}
+	/* DSISR should be set to correctly */
+	if (mfspr(DSISR) != DSISR_BAD_CONFIG) {
+		return 6;
+	}
 	unmap(ptr);
 
 	/* map an address and try to exec it */
 	map(ptr2, (void *)0x1000, DFLT_PERM);
 	/* this should fail */
 	if (test_exec(0, (unsigned long)ptr2, MSR_DFLT | MSR_IR)) {
-		return 4;
+		return 7;
 	}
 	/* SRR0 and SRR1 should be set correctly */
 	if (mfspr(SRR0) != (long) ptr2 ||
 	    mfspr(SRR1) != (MSR_DFLT | DSISR_BAD_CONFIG | MSR_IR)) {
-		return 5;
+		return 8;
 	}
 	unmap(ptr2);
 
-	if (!hv) {
-		return 0;
+	/* fix process table */
+	if (hv) {
+		store_pte(&part_tbl[1], (unsigned long)proc_tbl | PRTS);
+		tlbie_all(0);
+	} else {
+		register_process_table(
+			PROCTAB_DEREG | PROCTAB_RADIX | PROCTAB_GTSE,
+			misaligned_proc_tbl, PROCTAB_SIZE_SHIFT);
+		register_process_table(
+			PROCTAB_NEW | PROCTAB_RADIX | PROCTAB_GTSE,
+			(unsigned long)proc_tbl, PROCTAB_SIZE_SHIFT);
+		tlbie_all(PRS);
 	}
 
-	/* fix process table */
-	store_pte(&part_tbl[1], (unsigned long)proc_tbl | PRTS);
-	tlbie_all(0);
 	/* make sure it works */
 	map(ptr, mem, DFLT_PERM);
 	/* this should succeed */
 	if (!test_read(ptr, &val, 0xbadc0de)) {
-		return 6;
+		return 9;
 	}
 	/* dest load should have the value written */
 	if (val != 0xbadf00d) {
-		return 7;
+		return 10;
 	}
 	unmap(ptr);
 
 	return 0;
 }
 
-static int test_parttab_align(void)
+int test_parttab_align(void)
 {
 	unsigned long misaligned_part_tbl, *ptbl;
 	long *mem = (long *)  PA(0x010000);
@@ -780,15 +831,15 @@ static int test_parttab_align(void)
 	map(ptr, mem, DFLT_PERM);
 	/* this should fail */
 	if (test_read(ptr, &val, 0xbadc0de)) {
-		return 8;
+		return 11;
 	}
 	/* dest of load should be unchanged */
 	if (val != 0xbadc0de) {
-		return 9;
+		return 12;
 	}
 	/* HDSISR should be set to correctly */
 	if (mfspr(HDSISR) != DSISR_BAD_CONFIG) {
-		return 10;
+		return 13;
 	}
 	unmap(ptr);
 
@@ -796,14 +847,19 @@ static int test_parttab_align(void)
 	map(ptr2, (void *)0x1000, DFLT_PERM);
 	/* this should fail */
 	if (test_exec(0, (unsigned long)ptr2, MSR_DFLT | MSR_IR)) {
-		return 11;
+		return 14;
 	}
 	/* HSRR0 and HSRR1 should be set correctly */
 	if (mfspr(HSRR0) != (long) ptr2 ||
 	    mfspr(HSRR1) != (MSR_DFLT | DSISR_BAD_CONFIG | MSR_IR)) {
-		return 12;
+		return 15;
 	}
 	unmap(ptr2);
+
+	/* Fix partition table */
+	mmu_clear();
+	mtspr(PTCR, (unsigned long)part_tbl | PATS);
+	tlbie_all(0);
 
 	return 0;
 }
@@ -874,15 +930,14 @@ static void map_invalid(void *ea, void *pa, unsigned long perm_attr,
 	eas_mapped[neas_mapped++] = ea;
 }
 
-static int test_radix_tree_levels(void)
+int test_radix_tree_levels(void)
 {
 	long *mem = (long *)  PA(0x010000);
 	long *ptr = (long *)  VA(0x810000);
 	long val;
 
-	/* Fix tables */
-	init_mmu();
 	mmu_clear();
+	init_mmu();
 
 	/* Map levels with invalid sizes */
 
@@ -890,33 +945,35 @@ static int test_radix_tree_levels(void)
 	map_invalid(ptr, mem, DFLT_PERM, 3);
 	/* this should fail */
 	if (test_read(ptr, &val, 0xbadc0de)) {
-		return 13;
+		return 16;
 	}
 	/* DSISR should be set to correctly */
 	if (mfspr(DSISR) != DSISR_BAD_CONFIG) {
-		return 14;
+		return 17;
 	}
 	unmap(ptr);
+	/* reset pgdir (needed by KVM) */
+	zero_memory(pgdir, RPD_ENTRIES * sizeof(unsigned long));
 
 	map_invalid(ptr, mem, DFLT_PERM, 2);
 	/* this should fail */
 	if (test_read(ptr, &val, 0xbadc0de)) {
-		return 15;
+		return 18;
 	}
 	/* DSISR should be set to correctly */
 	if (mfspr(DSISR) != DSISR_BAD_CONFIG) {
-		return 16;
+		return 19;
 	}
 	unmap(ptr);
 
 	map_invalid(ptr, mem, DFLT_PERM, 1);
 	/* this should fail */
 	if (test_read(ptr, &val, 0xbadc0de)) {
-		return 17;
+		return 20;
 	}
 	/* DSISR should be set to correctly */
 	if (mfspr(DSISR) != DSISR_BAD_CONFIG) {
-		return 18;
+		return 21;
 	}
 	unmap(ptr);
 
@@ -924,11 +981,11 @@ static int test_radix_tree_levels(void)
 	map_invalid(ptr, mem, DFLT_PERM, 5);
 	/* this should fail */
 	if (test_read(ptr, &val, 0xbadc0de)) {
-		return 19;
+		return 22;
 	}
 	/* DSISR should be set to correctly */
 	if (mfspr(DSISR) != DSISR_BAD_CONFIG) {
-		return 20;
+		return 23;
 	}
 	unmap(ptr);
 
@@ -937,24 +994,34 @@ static int test_radix_tree_levels(void)
 
 int test_radix_config(void)
 {
+	bool hv;
 	int rc;
 
 	init_msr();
+	hv = mfmsr() & MSR_HV;
+#if KVM == 0 || KVM == 1
 	rc = test_proctab_align();
 	if (rc) {
 		return rc;
 	}
+#else
+	if (hv) {
+		init_mmu();
+	}
+#endif
 
-	if (!(mfmsr() & MSR_HV)) {
-		return 0;
+	if (hv) {
+		rc = test_parttab_align();
+		if (rc) {
+			return rc;
+		}
 	}
 
-	rc = test_parttab_align();
-	if (rc) {
-		return rc;
-	}
-
+#if KVM == 0 || KVM == 2
 	return test_radix_tree_levels();
+#else
+	return 0;
+#endif
 }
 
 #endif
@@ -1560,6 +1627,9 @@ int main(void)
 
 #if POWER9_MMU
 	do_test(0, test_radix_config);
+#	if KVM == 1 || KVM == 2
+	return 0;
+#	endif
 #endif
 
 	init_mmu();
